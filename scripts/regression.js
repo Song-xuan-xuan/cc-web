@@ -47,8 +47,20 @@ function sql(dbPath, statement) {
 async function waitForPort(port, timeoutMs = 10000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const probe = spawnSync('bash', ['-lc', `ss -tln | grep -q ':${port} '`], { encoding: 'utf8' });
-    if (probe.status === 0) return;
+    const reachable = await new Promise((resolve) => {
+      const socket = net.createConnection({ host: '127.0.0.1', port });
+      socket.setTimeout(300);
+      socket.on('connect', () => {
+        socket.destroy();
+        resolve(true);
+      });
+      socket.on('timeout', () => {
+        socket.destroy();
+        resolve(false);
+      });
+      socket.on('error', () => resolve(false));
+    });
+    if (reachable) return;
     await sleep(100);
   }
   throw new Error(`Timed out waiting for port ${port}`);
@@ -64,7 +76,7 @@ async function waitForFile(filePath, timeoutMs = 10000) {
 }
 
 async function withServer(env, fn) {
-  const child = spawn('/usr/bin/node', [SERVER_PATH], {
+  const child = spawn(process.execPath, [SERVER_PATH], {
     cwd: REPO_DIR,
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -75,7 +87,11 @@ async function withServer(env, fn) {
   child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
 
   try {
-    await waitForPort(env.PORT, 10000);
+    try {
+      await waitForPort(env.PORT, 10000);
+    } catch (err) {
+      throw new Error(`${err.message}\nserver stdout:\n${stdout}\nserver stderr:\n${stderr}`);
+    }
     await fn({ child, stdout: () => stdout, stderr: () => stderr });
   } finally {
     child.kill('SIGTERM');
@@ -267,7 +283,7 @@ function createFakeCodexHistory(homeDir) {
       estimated_bytes INTEGER NOT NULL DEFAULT 0
     );
     INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, cli_version)
-    VALUES ('${threadId}', '${rolloutPath.replace(/'/g, "''")}', 1, 2, 'exec', 'OpenAI', '/tmp/project-b', 'Codex import prompt', '{}', 'never', '0.114.0');
+    VALUES ('${threadId}', '${rolloutPath.replace(/'/g, "''")}', 1, 2, 'exec', 'OpenAI', '/tmp/project-b', 'Codex renamed title', '{}', 'never', '0.114.0');
     INSERT INTO logs (ts, ts_nanos, level, target, thread_id) VALUES (1, 0, 'INFO', 'test', '${threadId}');
   `);
 
@@ -373,6 +389,13 @@ async function main() {
     ws.send(JSON.stringify({ type: 'message', text: '/model gpt-5.3-codex', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }));
     const codexModelChanged = await nextMessage(messages, ws, (msg) => msg.type === 'model_changed' && msg.model === 'gpt-5.3-codex');
     assert(codexModelChanged.model === 'gpt-5.3-codex', 'Codex /model should accept arbitrary Codex model names');
+
+    ws.send(JSON.stringify({ type: 'message', text: '/goal improve codex coverage', sessionId: codexSession.sessionId, mode: 'plan', agent: 'codex' }));
+    const codexGoalPassthrough = await nextMessage(messages, ws, (msg) => (
+      msg.type === 'text_delta' && /\/goal improve codex coverage/.test(msg.text || '')
+    ));
+    assert(/\/goal improve codex coverage/.test(codexGoalPassthrough.text || ''), 'Codex native slash command should pass through to Codex exec');
+    await nextMessage(messages, ws, (msg) => msg.type === 'done' && msg.sessionId === codexSession.sessionId);
 
     const codexAttachment = await uploadAttachment(port, token, {
       filename: 'codex-test.png',
@@ -527,9 +550,10 @@ async function main() {
     const codexSessions = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
     const importedCodexItem = codexSessions.sessions.find((item) => item.threadId === codexFixture.threadId);
     assert(importedCodexItem, 'Codex session listing failed');
+    assert(importedCodexItem.title === 'Codex renamed title', 'Codex session listing should prefer SQLite renamed title');
 
     ws.send(JSON.stringify({ type: 'import_codex_session', threadId: importedCodexItem.threadId, rolloutPath: importedCodexItem.rolloutPath }));
-    const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex import prompt');
+    const importedCodex = await nextMessage(messages, ws, (msg) => msg.type === 'session_info' && msg.agent === 'codex' && msg.title === 'Codex renamed title');
     assert(importedCodex.messages?.[0]?.content === 'Codex import prompt', 'Codex import kept wrapper instructions');
     assert(importedCodex.totalUsage?.inputTokens === 20, 'Codex import usage parse failed');
 
@@ -538,8 +562,13 @@ async function main() {
     await nextMessage(messages, ws, (msg) => msg.type === 'session_list' && !msg.sessions.some((s) => s.id === importedSessionId));
 
     assert(!fs.existsSync(path.join(sessionsDir, `${importedSessionId}.json`)), 'Deleting Codex session did not remove session JSON');
-    assert(!fs.existsSync(codexFixture.rolloutPath), 'Deleting Codex session did not remove rollout file');
-    assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '0', 'Deleting Codex session did not remove thread row');
+    assert(fs.existsSync(codexFixture.rolloutPath), 'Deleting cc-web Codex session should preserve local rollout file');
+    assert(sql(codexFixture.stateDb, `select count(*) from threads where id='${codexFixture.threadId}'`) === '1', 'Deleting cc-web Codex session should preserve local thread row');
+
+    ws.send(JSON.stringify({ type: 'list_codex_sessions' }));
+    const codexSessionsAfterDelete = await nextMessage(messages, ws, (msg) => msg.type === 'codex_sessions');
+    const reimportableCodexItem = codexSessionsAfterDelete.sessions.find((item) => item.threadId === codexFixture.threadId);
+    assert(reimportableCodexItem && !reimportableCodexItem.alreadyImported, 'Deleted cc-web Codex session should be available for re-import');
 
     ws.close();
     console.log('Regression checks passed.');

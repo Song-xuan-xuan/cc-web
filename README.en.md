@@ -19,7 +19,7 @@ A lightweight browser interface for Claude Code and Codex, designed to keep each
 - **Dual-agent sessions**: create Claude or Codex sessions on the same backend core.
 - **Agent-isolated views**: switching Claude / Codex only shows that agent's sessions, recent state, settings, and import entry points.
 - **Agent-specific settings**: Claude keeps template-based model config; Codex has its own path, default model, mode, and search settings.
-- **Multi-session management**: create, switch, rename, and delete sessions; deleting a session also removes the local Claude history record.
+- **Multi-session management**: create, switch, rename, and delete sessions; deleting a session only removes cc-web records and preserves local Claude / Codex history for future imports.
 - **Local history import**: import Claude history from `~/.claude/projects/` and Codex rollout history from `~/.codex/sessions/`.
 - **Session resume**: context continuity via `--resume`; you can also reattach via SSH + `tmux attach -t claude` when needed.
 - **Background task support**: Claude processes continue after browser disconnect and notify you on completion.

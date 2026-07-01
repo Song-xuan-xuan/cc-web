@@ -1531,7 +1531,10 @@ body.session-loading-active {
   box-shadow: 0 4px 20px rgba(45, 31, 20, 0.12);
   padding: 6px;
   min-width: 240px;
-  max-width: 320px;
+  width: min(420px, calc(100vw - 32px));
+  max-height: min(360px, calc(100vh - 180px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   z-index: 50;
 }
 .cmd-item {
@@ -1543,16 +1546,22 @@ body.session-loading-active {
   cursor: pointer;
   transition: background 0.12s;
 }
+.cmd-item + .cmd-item { margin-top: 2px; }
 .cmd-item:hover, .cmd-item.active { background: var(--accent-light); }
 .cmd-item-cmd {
   font-weight: 600;
   font-size: 14px;
   color: var(--accent);
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 .cmd-item-desc {
   font-size: 13px;
   color: var(--text-secondary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* === Input Area === */

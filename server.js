@@ -581,6 +581,34 @@ const DEFAULT_CODEX_CONFIG = {
   localSnapshot: {},  // saved snapshot of local ~/.codex config (archive-only, no restore)
 };
 
+// Codex TUI slash commands that cc-web does not handle itself but can pass
+// through to `codex exec`. Keep this list in sync with the installed Codex CLI.
+const CODEX_NATIVE_SLASH_COMMANDS = new Map([
+  ['/goal', '设置、编辑、暂停、恢复或清除当前 Codex goal'],
+  ['/usage', '查看 Codex token/额度使用情况'],
+  ['/mcp', '查看 Codex MCP server 状态'],
+  ['/ide', '查看或切换 Codex IDE context'],
+  ['/keymap', '查看 Codex 快捷键配置'],
+  ['/raw', '切换 Codex raw event/debug 输出'],
+  ['/sandbox-add-read-dir', '为 Codex sandbox 增加只读目录'],
+  ['/memories', '管理 Codex memories'],
+  ['/import', '导入 Claude Code 配置/历史到 Codex'],
+  ['/resume', '恢复已有 Codex 会话'],
+  ['/side', '开启 Codex side conversation'],
+  ['/archive', '归档当前 Codex 会话'],
+  ['/delete', '删除当前 Codex 会话'],
+]);
+
+function isCodexNativeSlashCommand(cmd) {
+  return CODEX_NATIVE_SLASH_COMMANDS.has(String(cmd || '').toLowerCase());
+}
+
+function codexNativeSlashHelp() {
+  return Array.from(CODEX_NATIVE_SLASH_COMMANDS.entries())
+    .map(([command, desc]) => `${command} — ${desc}`)
+    .join('\n');
+}
+
 function splitCodexModelSpec(model) {
   const raw = String(model || '').trim();
   if (!raw) return { raw: '', base: '', reasoning: '' };
@@ -2672,14 +2700,31 @@ function handleSlashCommand(ws, text, sessionId, fallbackAgent) {
       wsSend(ws, {
         type: 'system_message',
         message: agent === 'codex'
-          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md'
+          ? base + '\n/model [名称] — 查看/切换 Codex 模型（自由输入）\n/compact — 执行 Codex /compact 压缩上下文\n/init — 分析项目并生成/更新 AGENTS.md\n\nCodex 原生命令（白名单透传到 codex exec）:\n' + codexNativeSlashHelp()
           : base + '\n/model [名称] — 查看/切换模型（opus, sonnet, haiku）\n/compact — 执行 Claude 原生上下文压缩（保留压缩计划并可自动续跑）\n/init — 分析项目并生成/更新 CLAUDE.md',
       });
       break;
     }
 
     default:
-      wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
+      if (agent === 'codex' && isCodexNativeSlashCommand(cmd)) {
+        if (!sessionId || !session) {
+          wsSend(ws, { type: 'system_message', message: '请先进入一个 Codex 会话后再执行该命令。' });
+          break;
+        }
+        if (activeProcesses.has(sessionId)) {
+          wsSend(ws, { type: 'system_message', message: '当前会话正在处理中，请先等待完成或点击停止。' });
+          break;
+        }
+        handleMessage(ws, {
+          text,
+          sessionId: session.id,
+          mode: session.permissionMode || 'yolo',
+          agent: 'codex',
+        });
+      } else {
+        wsSend(ws, { type: 'system_message', message: `未知指令: ${cmd}\n输入 /help 查看可用指令` });
+      }
   }
 }
 
@@ -2858,67 +2903,6 @@ function handleLoadSession(ws, sessionId) {
   }
 }
 
-function sqlQuote(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function deleteClaudeLocalSession(claudeSessionId) {
-  if (!claudeSessionId) return;
-  const projectsDir = path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude', 'projects');
-  try {
-    for (const proj of fs.readdirSync(projectsDir)) {
-      const target = path.join(projectsDir, proj, `${claudeSessionId}.jsonl`);
-      if (fs.existsSync(target)) fs.unlinkSync(target);
-    }
-  } catch {}
-}
-
-function deleteCodexLocalSession(session) {
-  const threadId = session?.codexThreadId;
-  if (!threadId) return { removedFiles: 0, removedDbRows: false };
-
-  const rolloutPaths = new Set();
-  if (session.importedRolloutPath) rolloutPaths.add(path.resolve(session.importedRolloutPath));
-  try {
-    for (const filePath of getCodexRolloutFiles()) {
-      if (filePath.includes(threadId)) rolloutPaths.add(path.resolve(filePath));
-    }
-  } catch {}
-
-  let removedFiles = 0;
-  for (const filePath of rolloutPaths) {
-    try {
-      if (filePath.startsWith(CODEX_SESSIONS_DIR) && fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-        removedFiles++;
-      }
-    } catch {}
-  }
-
-  let removedDbRows = false;
-  try {
-    const sqlitePath = spawnSync('sqlite3', ['-version'], { stdio: 'ignore' });
-    if (sqlitePath.status === 0) {
-      const quotedThreadId = sqlQuote(threadId);
-      const stateSql = [
-        'PRAGMA foreign_keys = ON;',
-        `DELETE FROM thread_dynamic_tools WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM stage1_outputs WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`,
-        `DELETE FROM threads WHERE id = ${quotedThreadId};`,
-      ].join(' ');
-      const stateResult = spawnSync('sqlite3', [CODEX_STATE_DB_PATH, stateSql], { stdio: 'ignore' });
-      if (stateResult.status === 0) removedDbRows = true;
-
-      if (fs.existsSync(CODEX_LOG_DB_PATH)) {
-        spawnSync('sqlite3', [CODEX_LOG_DB_PATH, `DELETE FROM logs WHERE thread_id = ${quotedThreadId};`], { stdio: 'ignore' });
-      }
-    }
-  } catch {}
-
-  return { removedFiles, removedDbRows };
-}
-
 function handleDeleteSession(ws, sessionId) {
   pendingSlashCommands.delete(sessionId);
   pendingCompactRetries.delete(sessionId);
@@ -2938,17 +2922,12 @@ function handleDeleteSession(ws, sessionId) {
       removeAttachmentById(attachmentId);
     }
     if (fs.existsSync(p)) fs.unlinkSync(p);
-    if (sessionAgent === 'codex') {
-      const result = deleteCodexLocalSession(session);
-      plog('INFO', 'codex_local_session_deleted', {
-        sessionId: sessionId.slice(0, 8),
-        threadId: session?.codexThreadId || null,
-        removedFiles: result.removedFiles,
-        removedDbRows: result.removedDbRows,
-      });
-    } else {
-      deleteClaudeLocalSession(session?.claudeSessionId || null);
-    }
+    plog('INFO', 'session_deleted', {
+      sessionId: sessionId.slice(0, 8),
+      agent: sessionAgent,
+      runtimeSessionId: getRuntimeSessionId(session) || null,
+      localHistoryPreserved: true,
+    });
     sendSessionList(ws);
   } catch {
     wsSend(ws, { type: 'error', message: 'Failed to delete session' });
@@ -3381,6 +3360,86 @@ const CODEX_SESSIONS_DIR = path.join(process.env.HOME || process.env.USERPROFILE
 const CODEX_STATE_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'state_5.sqlite');
 const CODEX_LOG_DB_PATH = path.join(process.env.HOME || process.env.USERPROFILE || '', '.codex', 'logs_1.sqlite');
 
+function escapeSqlString(value) {
+  return String(value || '').replace(/'/g, "''");
+}
+
+function normalizeTitleText(value, maxLength = 80) {
+  const text = String(value || '').trim().replace(/\s+/g, ' ');
+  return text ? text.slice(0, maxLength) : '';
+}
+
+function normalizeCodexTimestamp(value) {
+  if (value == null || value === '') return null;
+  const numeric = Number(value);
+  if (!Number.isNaN(numeric) && Number.isFinite(numeric)) {
+    const ms = numeric > 100000000000 ? numeric : numeric * 1000;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  const date = new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function readCodexThreadMeta(threadId) {
+  if (!threadId || !fs.existsSync(CODEX_STATE_DB_PATH)) return null;
+  const sql = [
+    'SELECT title, cwd, updated_at, cli_version, source, rollout_path',
+    'FROM threads',
+    `WHERE id = '${escapeSqlString(threadId)}'`,
+    'LIMIT 1;',
+  ].join(' ');
+  try {
+    const result = spawnSync('sqlite3', ['-json', CODEX_STATE_DB_PATH, sql], {
+      encoding: 'utf8',
+      timeout: 2000,
+      maxBuffer: 1024 * 1024,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) return null;
+    const rows = JSON.parse(result.stdout);
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return null;
+    return {
+      title: normalizeTitleText(row.title),
+      cwd: row.cwd || null,
+      updatedAt: normalizeCodexTimestamp(row.updated_at),
+      cliVersion: row.cli_version || '',
+      source: row.source || '',
+      rolloutPath: row.rollout_path || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readCodexThreadMetaMap() {
+  const metaMap = new Map();
+  if (!fs.existsSync(CODEX_STATE_DB_PATH)) return metaMap;
+  const sql = 'SELECT id, title, cwd, updated_at, cli_version, source, rollout_path FROM threads;';
+  try {
+    const result = spawnSync('sqlite3', ['-json', CODEX_STATE_DB_PATH, sql], {
+      encoding: 'utf8',
+      timeout: 3000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) return metaMap;
+    const rows = JSON.parse(result.stdout);
+    if (!Array.isArray(rows)) return metaMap;
+    for (const row of rows) {
+      if (!row?.id) continue;
+      metaMap.set(row.id, {
+        title: normalizeTitleText(row.title),
+        cwd: row.cwd || null,
+        updatedAt: normalizeCodexTimestamp(row.updated_at),
+        cliVersion: row.cli_version || '',
+        source: row.source || '',
+        rolloutPath: row.rollout_path || '',
+      });
+    }
+  } catch {}
+  return metaMap;
+}
+
 function resolveClaudeSessionLocalMeta(claudeSessionId) {
   if (!claudeSessionId) return null;
   try {
@@ -3627,6 +3686,7 @@ function handleImportNativeSession(ws, msg) {
 
 function handleListCodexSessions(ws) {
   const imported = getImportedCodexThreadIds();
+  const threadMetaMap = readCodexThreadMetaMap();
   const items = [];
   const seen = new Set();
   for (const filePath of getCodexRolloutFiles()) {
@@ -3634,14 +3694,15 @@ function handleListCodexSessions(ws) {
     if (!parsed?.meta?.threadId) continue;
     if (seen.has(parsed.meta.threadId)) continue;
     seen.add(parsed.meta.threadId);
-    const title = parsed.meta.title || parsed.meta.threadId.slice(0, 20);
+    const threadMeta = threadMetaMap.get(parsed.meta.threadId);
+    const title = threadMeta?.title || parsed.meta.title || parsed.meta.threadId.slice(0, 20);
     items.push({
       threadId: parsed.meta.threadId,
       title,
-      cwd: parsed.meta.cwd || null,
-      updatedAt: parsed.meta.updatedAt || null,
-      cliVersion: parsed.meta.cliVersion || '',
-      source: parsed.meta.source || '',
+      cwd: threadMeta?.cwd || parsed.meta.cwd || null,
+      updatedAt: threadMeta?.updatedAt || parsed.meta.updatedAt || null,
+      cliVersion: threadMeta?.cliVersion || parsed.meta.cliVersion || '',
+      source: threadMeta?.source || parsed.meta.source || '',
       rolloutPath: filePath,
       alreadyImported: imported.has(parsed.meta.threadId),
     });
@@ -3684,10 +3745,11 @@ function handleImportCodexSession(ws, msg) {
     }
   } catch {}
 
+  const threadMeta = readCodexThreadMeta(threadId);
   const id = existingSession ? existingSession.id : crypto.randomUUID();
   const session = {
     id,
-    title: parsed.meta.title || existingSession?.title || threadId.slice(0, 20),
+    title: existingSession?.title || threadMeta?.title || parsed.meta.title || threadId.slice(0, 20),
     created: existingSession?.created || new Date().toISOString(),
     updated: new Date().toISOString(),
     agent: 'codex',
@@ -3700,7 +3762,7 @@ function handleImportCodexSession(ws, msg) {
     totalCost: existingSession?.totalCost || 0,
     totalUsage: parsed.totalUsage || existingSession?.totalUsage || { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
     messages: parsed.messages,
-    cwd: parsed.meta.cwd || existingSession?.cwd || null,
+    cwd: existingSession?.cwd || threadMeta?.cwd || parsed.meta.cwd || null,
   };
 
   saveSession(session);

@@ -25,7 +25,7 @@ https://github.com/ZgDaniel/cc-web 给我装！
 ## 功能特性
 
 - **超轻量** — 后端性能占用少，前端通过 web 访问
-- **多会话管理** — 创建、切换、重命名、删除会话，删除时同步清除本地 Claude 历史记录
+- **多会话管理** — 创建、切换、重命名、删除会话；删除仅移除 cc-web 记录，保留本地 Claude / Codex 历史以便再次导入
 - **本地历史导入** — Claude 可导入 `~/.claude/projects/` 会话；Codex 可导入 `~/.codex/sessions/` rollout 历史
 - **后台任务** — 关闭浏览器后 Claude 进程继续运行，完成后推送通知，支持 PushPlus / Telegram / Server酱 / 飞书机器人 / QQ（Qmsg）
 - **多 API 切换** — 可配置多个 API 方案，一键切换，即时生效

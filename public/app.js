@@ -5,7 +5,7 @@
   const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
   const RENDER_DEBOUNCE = 100;
 
-  const SLASH_COMMANDS = [
+  const CC_WEB_SLASH_COMMANDS = [
     { cmd: '/clear', desc: '清除当前会话' },
     { cmd: '/model', desc: '查看/切换模型' },
     { cmd: '/mode', desc: '查看/切换权限模式' },
@@ -16,6 +16,23 @@
     { cmd: '/ssh', desc: 'SSH 远程操作（读取开发者配置后执行）' },
     { cmd: '/help', desc: '显示帮助' },
   ];
+
+  const CODEX_NATIVE_SLASH_COMMANDS = [
+    { cmd: '/goal', desc: 'Codex 原生：管理 goal' },
+    { cmd: '/usage', desc: 'Codex 原生：查看 token/额度' },
+    { cmd: '/mcp', desc: 'Codex 原生：查看 MCP 状态' },
+    { cmd: '/ide', desc: 'Codex 原生：管理 IDE context' },
+    { cmd: '/keymap', desc: 'Codex 原生：查看快捷键' },
+    { cmd: '/raw', desc: 'Codex 原生：切换 raw/debug 输出' },
+    { cmd: '/sandbox-add-read-dir', desc: 'Codex 原生：添加 sandbox 只读目录' },
+    { cmd: '/memories', desc: 'Codex 原生：管理 memories' },
+    { cmd: '/import', desc: 'Codex 原生：导入 Claude Code 设置' },
+    { cmd: '/resume', desc: 'Codex 原生：恢复会话' },
+    { cmd: '/side', desc: 'Codex 原生：开启 side conversation' },
+    { cmd: '/archive', desc: 'Codex 原生：归档会话' },
+    { cmd: '/delete', desc: 'Codex 原生：删除会话' },
+  ];
+  const CODEX_NATIVE_SLASH_COMMAND_SET = new Set(CODEX_NATIVE_SLASH_COMMANDS.map((command) => command.cmd));
 
   const MODE_LABELS = {
     default: '默认',
@@ -2428,9 +2445,9 @@
   function getDeleteConfirmMessage(agent) {
     const normalized = normalizeAgent(agent);
     if (normalized === 'codex') {
-      return '删除本会话将同步删去本地 Codex rollout 历史与线程记录，不可恢复。确认删除？';
+      return '删除本会话只会移除 cc-web 中的会话记录，不会删除本地 Codex 历史。确认删除？';
     }
-    return '删除本会话将同步删去本地 Claude 中的会话历史，不可恢复。确认删除？';
+    return '删除本会话只会移除 cc-web 中的会话记录，不会删除本地 Claude 历史。确认删除？';
   }
 
   function showDeleteConfirm(agent, onConfirm) {
@@ -2796,8 +2813,25 @@
   }
 
   // --- Slash Command Menu ---
+  function getSlashCommandsForCurrentAgent() {
+    const map = new Map();
+    for (const command of CC_WEB_SLASH_COMMANDS) map.set(command.cmd, command);
+    if (currentAgent === 'codex') {
+      for (const command of CODEX_NATIVE_SLASH_COMMANDS) {
+        if (!map.has(command.cmd)) map.set(command.cmd, command);
+      }
+    }
+    return Array.from(map.values());
+  }
+
+  function isCodexNativeSlashInput(text) {
+    if (currentAgent !== 'codex') return false;
+    const cmd = String(text || '').trim().split(/\s+/)[0].toLowerCase();
+    return CODEX_NATIVE_SLASH_COMMAND_SET.has(cmd);
+  }
+
   function showCmdMenu(filter) {
-    const filtered = SLASH_COMMANDS.filter(c =>
+    const filtered = getSlashCommandsForCurrentAgent().filter(c =>
       c.cmd.startsWith(filter) || c.desc.includes(filter.slice(1))
     );
     // Exact match first (fixes /mode vs /model ambiguity)
@@ -2848,7 +2882,9 @@
     if (items.length === 0) return;
     items[cmdMenuIndex]?.classList.remove('active');
     cmdMenuIndex = (cmdMenuIndex + direction + items.length) % items.length;
-    items[cmdMenuIndex]?.classList.add('active');
+    const active = items[cmdMenuIndex];
+    active?.classList.add('active');
+    active?.scrollIntoView({ block: 'nearest' });
   }
 
   function selectCmdMenuItem() {
@@ -2980,30 +3016,38 @@
     hideCmdMenu();
     hideOptionPicker();
 
-    // Slash commands: don't show as user bubble
+    // cc-web slash commands are control actions. Codex native slash commands
+    // are passed through to Codex and should behave like visible user messages.
     if (text.startsWith('/')) {
       if (pendingAttachments.length > 0) {
         appendError('命令消息暂不支持附带图片，请先移除图片或发送普通消息。');
         return;
       }
+      const isCodexNativeSlash = isCodexNativeSlashInput(text);
+      if (isCodexNativeSlash && !currentSessionId) {
+        appendError('请先进入一个 Codex 会话后再执行该命令。');
+        return;
+      }
+      if (!isCodexNativeSlash) {
       // /model without argument → show interactive picker
-      if (text === '/model' || text === '/model ') {
-        showModelPicker();
-        msgInput.value = '';
-        autoResize();
-        return;
-      }
+        if (text === '/model' || text === '/model ') {
+          showModelPicker();
+          msgInput.value = '';
+          autoResize();
+          return;
+        }
       // /mode without argument → show interactive picker
-      if (text === '/mode' || text === '/mode ') {
-        showModePicker();
+        if (text === '/mode' || text === '/mode ') {
+          showModePicker();
+          msgInput.value = '';
+          autoResize();
+          return;
+        }
+        send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
         msgInput.value = '';
         autoResize();
         return;
       }
-      send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
-      msgInput.value = '';
-      autoResize();
-      return;
     }
 
     // Regular message
