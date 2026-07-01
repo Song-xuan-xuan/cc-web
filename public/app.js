@@ -114,6 +114,7 @@
   let currentSessionRunning = false;
   let skipDeleteConfirm = localStorage.getItem('cc-web-skip-delete-confirm') === '1';
   let pendingInitialSessionLoad = false;
+  let hasCompletedInitialSessionLoad = false;
 
   // --- DOM ---
   const $ = (sel) => document.querySelector(sel);
@@ -141,16 +142,40 @@
   const chatRuntimeState = $('#chat-runtime-state');
   const chatCwd = $('#chat-cwd');
   const costDisplay = $('#cost-display');
+  const timelinePanel = $('#timeline-panel');
+  const timelineList = $('#timeline-list');
+  const timelineCount = $('#timeline-count');
+  const timelinePreview = $('#timeline-preview');
   const attachmentTray = $('#attachment-tray');
   const imageUploadInput = $('#image-upload-input');
   const attachBtn = $('#attach-btn');
   const messagesDiv = $('#messages');
+  const jumpBottomBtn = $('#jump-bottom-btn');
   const msgInput = $('#msg-input');
   const inputWrapper = msgInput.closest('.input-wrapper');
   const sendBtn = $('#send-btn');
   const abortBtn = $('#abort-btn');
   const cmdMenu = $('#cmd-menu');
   const modeSelect = $('#mode-select');
+  const BOTTOM_STICKY_THRESHOLD = 96;
+  let autoStickToBottom = true;
+  let suppressScrollStateUntil = 0;
+  let currentTimelineMessages = [];
+  let currentTimelineBaseIndex = 0;
+  const sessionTimeline = window.CCWebTimeline?.createSessionTimeline({
+    panel: timelinePanel,
+    listEl: timelineList,
+    countEl: timelineCount,
+    previewEl: timelinePreview,
+    messagesEl: messagesDiv,
+    onNavigate: (_index, target) => {
+      autoStickToBottom = false;
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.add('msg-highlight');
+      setTimeout(() => target.classList.remove('msg-highlight'), 1200);
+      updateJumpBottomButton();
+    },
+  }) || null;
 
   // --- Viewport height fix for mobile browsers ---
   function setVH() {
@@ -189,6 +214,52 @@
     document.documentElement.dataset.theme = currentTheme;
     localStorage.setItem('cc-web-theme', currentTheme);
     refreshThemeSummaries();
+  }
+
+  function resetSessionTimeline() {
+    currentTimelineMessages = [];
+    currentTimelineBaseIndex = 0;
+    if (sessionTimeline) sessionTimeline.clear();
+  }
+
+  function setSessionTimelineMessages(messages, baseIndex = 0) {
+    currentTimelineMessages = cloneMessages(messages || []);
+    currentTimelineBaseIndex = Math.max(0, baseIndex || 0);
+    if (sessionTimeline) {
+      sessionTimeline.setMessages(currentTimelineMessages, { baseIndex: currentTimelineBaseIndex });
+    }
+  }
+
+  function prependSessionTimelineMessages(messages) {
+    const olderMessages = cloneMessages(messages || []);
+    if (olderMessages.length === 0) return;
+    currentTimelineMessages = olderMessages.concat(currentTimelineMessages);
+    currentTimelineBaseIndex = Math.max(0, currentTimelineBaseIndex - olderMessages.length);
+    if (sessionTimeline) {
+      sessionTimeline.setMessages(currentTimelineMessages, { baseIndex: currentTimelineBaseIndex });
+    }
+  }
+
+  function appendSessionTimelineMessage(message) {
+    if (!message) return;
+    currentTimelineMessages.push(deepClone(message));
+    if (sessionTimeline) {
+      sessionTimeline.setMessages(currentTimelineMessages, { baseIndex: currentTimelineBaseIndex });
+    }
+  }
+
+  function appendVisibleUserMessage(text, attachments = []) {
+    const message = {
+      role: 'user',
+      content: text,
+      attachments,
+      timestamp: new Date().toISOString(),
+    };
+    const messageIndex = currentTimelineBaseIndex + currentTimelineMessages.length;
+    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    const el = messagesDiv.lastElementChild;
+    if (el) el.dataset.messageIndex = String(messageIndex);
+    appendSessionTimelineMessage(message);
   }
 
   function buildThemePickerHtml(options = {}) {
@@ -708,6 +779,8 @@
       updated: payload.updated || null,
       isRunning: !!payload.isRunning,
       historyPending: !!payload.historyPending,
+      historyTotal: Number.isFinite(payload.historyTotal) ? payload.historyTotal : (payload.messages || []).length,
+      historyBuffered: Number.isFinite(payload.historyBuffered) ? payload.historyBuffered : (payload.messages || []).length,
       complete: options.complete !== undefined ? !!options.complete : !payload.historyPending,
     };
   }
@@ -1141,6 +1214,9 @@
     chatTitle.textContent = '新会话';
     updateCwdBadge();
     messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+    autoStickToBottom = true;
+    updateJumpBottomButton();
+    resetSessionTimeline();
     setStatsDisplay(null);
     renderPendingAttachments();
     highlightActiveSession();
@@ -1171,8 +1247,16 @@
       localStorage.setItem(getAgentModeStorageKey(currentAgent), currentMode);
     }
     currentModel = snapshot.model || '';
+    setSessionTimelineMessages(
+      snapshot.messages || [],
+      Math.max(0, (snapshot.historyTotal || 0) - (snapshot.historyBuffered || (snapshot.messages || []).length))
+    );
     if (!preserveStreaming) {
-      renderMessages(snapshot.messages || [], { immediate: !!options.immediate });
+      renderMessages(snapshot.messages || [], {
+        immediate: !!options.immediate,
+        preserveScroll: !!options.preserveScroll,
+        scrollState: options.scrollState || null,
+      });
     }
     highlightActiveSession();
     renderSessionList();
@@ -1217,7 +1301,7 @@
   function setSessionLoading(sessionId, options = {}) {
     const loading = !!sessionId;
     const blocking = options.blocking !== false;
-    activeSessionLoad = loading ? { sessionId, blocking, snapshot: null } : null;
+    activeSessionLoad = loading ? { sessionId, blocking, snapshot: null, scrollState: options.scrollState || null } : null;
     const showOverlay = !!(loading && blocking);
     document.body.classList.toggle('session-loading-active', showOverlay);
     sessionLoadingOverlay.hidden = !showOverlay;
@@ -1266,9 +1350,12 @@
     const force = options.force === true;
     if (!force && activeSessionLoad?.sessionId === sessionId) return;
     if (!force && sessionId === currentSessionId && !activeSessionLoad) return;
+    const scrollState = options.preserveScroll && sessionId === currentSessionId
+      ? captureMessagesScrollState()
+      : null;
     renderEpoch++;
     loadedHistorySessionId = null;
-    setSessionLoading(sessionId, { blocking, label: options.label });
+    setSessionLoading(sessionId, { blocking, label: options.label, scrollState });
     send({ type: 'load_session', sessionId });
   }
 
@@ -1287,7 +1374,12 @@
   function openSession(sessionId, options = {}) {
     if (!sessionId) return;
     if (options.forceSync) {
-      beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: true, label: options.label });
+      beginSessionSwitch(sessionId, {
+        blocking: options.blocking !== false,
+        force: true,
+        label: options.label,
+        preserveScroll: options.preserveScroll === true,
+      });
       return;
     }
     if (!options.force && sessionId === currentSessionId && !activeSessionLoad) return;
@@ -1298,10 +1390,15 @@
       return;
     }
     if (disposition === 'weak' && showCachedSession(sessionId)) {
-      beginSessionSwitch(sessionId, { blocking: false, force: true, label: options.label });
+      beginSessionSwitch(sessionId, { blocking: false, force: true, label: options.label, preserveScroll: options.preserveScroll === true });
       return;
     }
-    beginSessionSwitch(sessionId, { blocking: options.blocking !== false, force: options.force === true, label: options.label });
+    beginSessionSwitch(sessionId, {
+      blocking: options.blocking !== false,
+      force: options.force === true,
+      label: options.label,
+      preserveScroll: options.preserveScroll === true,
+    });
   }
 
   function setStatsDisplay(msg) {
@@ -1510,7 +1607,7 @@
           if (msg.mustChangePassword) {
             showForceChangePassword();
           } else {
-            pendingInitialSessionLoad = true;
+            pendingInitialSessionLoad = !hasCompletedInitialSessionLoad && !currentSessionId;
           }
         } else {
           authToken = null;
@@ -1539,6 +1636,7 @@
         }
         if (pendingInitialSessionLoad) {
           pendingInitialSessionLoad = false;
+          hasCompletedInitialSessionLoad = true;
           syncViewForAgent(currentAgent, { preserveCurrent: false, loadLast: true });
         } else if (currentSessionId && !getSessionMeta(currentSessionId)) {
           resetChatView(currentAgent);
@@ -1547,6 +1645,9 @@
 
       case 'session_info':
         const snapshot = normalizeSessionSnapshot(msg);
+        const activeScrollState = activeSessionLoad?.sessionId === msg.sessionId
+          ? activeSessionLoad.scrollState
+          : null;
         if (activeSessionLoad?.sessionId === msg.sessionId) {
           activeSessionLoad.snapshot = snapshot;
         }
@@ -1554,6 +1655,8 @@
           immediate: isBlockingSessionLoad(msg.sessionId),
           suppressUnreadToast: false,
           preserveStreaming: msg.sessionId === currentSessionId && msg.isRunning,
+          preserveScroll: msg.sessionId === currentSessionId && !isBlockingSessionLoad(msg.sessionId),
+          scrollState: activeScrollState,
         });
         if (!msg.historyPending) {
           if (activeSessionLoad?.sessionId === msg.sessionId) {
@@ -1745,9 +1848,9 @@
         // A background task completed (browser was disconnected or viewing another session)
         showToast(`「${msg.title}」任务完成`, msg.sessionId);
         showBrowserNotification(msg.title);
-        if (msg.sessionId === currentSessionId) {
+        if (msg.sessionId === currentSessionId && autoStickToBottom) {
           // Reload current session to show completed response
-          openSession(msg.sessionId, { forceSync: true, blocking: false });
+          openSession(msg.sessionId, { forceSync: true, blocking: false, preserveScroll: true });
         } else {
           send({ type: 'list_sessions' });
         }
@@ -1776,7 +1879,8 @@
   }
 
   // --- Generating State ---
-  function startGenerating() {
+  function startGenerating(options = {}) {
+    const shouldFollow = options.forceScroll === true || autoStickToBottom || isNearBottom();
     isGenerating = true;
     setCurrentSessionRunningState(true);
     pendingText = '';
@@ -1803,7 +1907,12 @@
     bubble.appendChild(textDiv);
     bubble.appendChild(toolsDiv);
     messagesDiv.appendChild(msgEl);
-    scrollToBottom();
+    if (shouldFollow) scrollToBottom();
+    else {
+      autoStickToBottom = false;
+      updateScrollbar();
+      updateJumpBottomButton();
+    }
   }
 
   function finishGenerating(sessionId) {
@@ -1871,7 +1980,7 @@
     let textDiv = bubble.querySelector('.msg-text');
     if (!textDiv) { textDiv = bubble; }
     textDiv.innerHTML = renderMarkdown(pendingText);
-    scrollToBottom();
+    maybeScrollToBottom();
   }
 
   function renderMarkdown(text) {
@@ -2016,8 +2125,11 @@
     return section;
   }
 
-	  function buildMsgElement(m) {
+	  function buildMsgElement(m, messageIndex = null) {
 	    const el = createMsgElement(m.role, m.content, m.attachments || []);
+	    if (Number.isFinite(messageIndex)) {
+	      el.dataset.messageIndex = String(messageIndex);
+	    }
 	    if (m.role === 'assistant' && m.toolCalls && m.toolCalls.length > 0) {
 	      const bubble = el.querySelector('.msg-bubble');
 	      const FOLD_AT = 3;
@@ -2066,16 +2178,29 @@
   function renderMessages(messages, options = {}) {
     renderEpoch++;
     const epoch = renderEpoch;
+    const scrollState = options.scrollState || null;
+    const preserveScroll = options.preserveScroll === true && !(scrollState ? scrollState.autoStickToBottom : autoStickToBottom);
+    const prevScrollTop = scrollState ? scrollState.scrollTop : messagesDiv.scrollTop;
+    suppressProgrammaticScrollState();
     messagesDiv.innerHTML = '';
     if (messages.length === 0) {
       messagesDiv.innerHTML = buildWelcomeMarkup(currentAgent);
+      autoStickToBottom = true;
+      updateJumpBottomButton();
       return;
     }
-    if (options.immediate) {
+    if (options.immediate || preserveScroll) {
       const frag = document.createDocumentFragment();
-      messages.forEach((message) => frag.appendChild(buildMsgElement(message)));
+      messages.forEach((message, offset) => frag.appendChild(buildMsgElement(message, currentTimelineBaseIndex + offset)));
       messagesDiv.appendChild(frag);
-      scrollToBottom();
+      if (preserveScroll) {
+        if (scrollState) autoStickToBottom = scrollState.autoStickToBottom;
+        setMessagesScrollTop(Math.min(prevScrollTop, Math.max(0, messagesDiv.scrollHeight - messagesDiv.clientHeight)));
+        updateScrollbar();
+        updateJumpBottomButton();
+      } else {
+        scrollToBottom();
+      }
       return;
     }
     // Batch render: last 10 first, then next 20, then the rest
@@ -2094,7 +2219,7 @@
 
     // Render first batch immediately
     const frag0 = document.createDocumentFragment();
-    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i]));
+    for (let i = batches[0][0]; i < batches[0][1]; i++) frag0.appendChild(buildMsgElement(messages[i], currentTimelineBaseIndex + i));
     messagesDiv.appendChild(frag0);
     scrollToBottom();
 
@@ -2109,10 +2234,10 @@
         const prevHeight = messagesDiv.scrollHeight;
         const prevScrollTop = messagesDiv.scrollTop;
         const frag = document.createDocumentFragment();
-        for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i]));
+        for (let i = start; i < end; i++) frag.appendChild(buildMsgElement(messages[i], currentTimelineBaseIndex + i));
         messagesDiv.insertBefore(frag, messagesDiv.firstChild);
         // Compensate scrollTop so visible area stays unchanged
-        messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+        setMessagesScrollTop(prevScrollTop + (messagesDiv.scrollHeight - prevHeight));
         updateScrollbar();
       }, delay);
     }
@@ -2125,17 +2250,21 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const frag = document.createDocumentFragment();
-    messages.forEach((m) => frag.appendChild(buildMsgElement(m)));
+    const startIndex = currentTimelineBaseIndex - messages.length;
+    messages.forEach((m, offset) => frag.appendChild(buildMsgElement(m, startIndex + offset)));
+    prependSessionTimelineMessages(messages);
     if (!preserveScroll) {
       messagesDiv.insertBefore(frag, messagesDiv.firstChild);
       if (!skipScrollbar) updateScrollbar();
+      updateJumpBottomButton();
       return;
     }
     const prevHeight = messagesDiv.scrollHeight;
     const prevScrollTop = messagesDiv.scrollTop;
     messagesDiv.insertBefore(frag, messagesDiv.firstChild);
-    messagesDiv.scrollTop = prevScrollTop + (messagesDiv.scrollHeight - prevHeight);
+    setMessagesScrollTop(prevScrollTop + (messagesDiv.scrollHeight - prevHeight));
     if (!skipScrollbar) updateScrollbar();
+    updateJumpBottomButton();
   }
 
   function normalizeAskUserInput(input) {
@@ -2413,7 +2542,7 @@
       _refreshGroupSummary(group);
     }
     toolsDiv.appendChild(details);
-    scrollToBottom();
+    maybeScrollToBottom();
   }
 
   function _refreshGroupSummary(group) {
@@ -2440,6 +2569,7 @@
     const nextContent = buildToolContentElement(tool);
     const content = el.querySelector('.tool-call-content');
     if (content) content.replaceWith(nextContent);
+    maybeScrollToBottom();
   }
 
   function getDeleteConfirmMessage(agent) {
@@ -2484,7 +2614,7 @@
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     messagesDiv.appendChild(createMsgElement('system', message));
-    scrollToBottom();
+    maybeScrollToBottom();
   }
 
   function appendError(message) {
@@ -2492,14 +2622,55 @@
     div.className = 'msg system';
     div.innerHTML = `<div class="msg-bubble" style="border-color:var(--danger);color:var(--danger)">⚠ ${escapeHtml(message)}</div>`;
     messagesDiv.appendChild(div);
-    scrollToBottom();
+    maybeScrollToBottom();
   }
 
   function scrollToBottom() {
+    autoStickToBottom = true;
     requestAnimationFrame(() => {
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+      setMessagesScrollTop(messagesDiv.scrollHeight);
       updateScrollbar();
+      updateJumpBottomButton();
     });
+  }
+
+  function suppressProgrammaticScrollState(ms = 120) {
+    suppressScrollStateUntil = Math.max(suppressScrollStateUntil, Date.now() + ms);
+  }
+
+  function setMessagesScrollTop(value) {
+    suppressProgrammaticScrollState();
+    messagesDiv.scrollTop = value;
+    requestAnimationFrame(() => {
+      updateJumpBottomButton();
+    });
+  }
+
+  function isNearBottom() {
+    const distance = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
+    return distance <= BOTTOM_STICKY_THRESHOLD;
+  }
+
+  function captureMessagesScrollState() {
+    return {
+      scrollTop: messagesDiv.scrollTop,
+      autoStickToBottom,
+    };
+  }
+
+  function updateJumpBottomButton() {
+    if (!jumpBottomBtn) return;
+    const canScroll = messagesDiv.scrollHeight > messagesDiv.clientHeight + BOTTOM_STICKY_THRESHOLD;
+    jumpBottomBtn.hidden = !canScroll || autoStickToBottom || isNearBottom();
+  }
+
+  function maybeScrollToBottom() {
+    if (autoStickToBottom || isNearBottom()) {
+      scrollToBottom();
+    } else {
+      updateScrollbar();
+      updateJumpBottomButton();
+    }
   }
 
   // --- Custom Scrollbar ---
@@ -2522,6 +2693,10 @@
   }
 
   messagesDiv.addEventListener('scroll', () => {
+    if (Date.now() >= suppressScrollStateUntil) {
+      autoStickToBottom = isNearBottom();
+    }
+    updateJumpBottomButton();
     updateScrollbar();
     // 移动端：滚动时短暂显示滑块，停止后淡出
     scrollbarEl.classList.add('scrolling');
@@ -2530,7 +2705,13 @@
       if (!isDragging) scrollbarEl.classList.remove('scrolling');
     }, 1200);
   }, { passive: true });
-  new ResizeObserver(updateScrollbar).observe(messagesDiv);
+  if (jumpBottomBtn) {
+    jumpBottomBtn.addEventListener('click', () => scrollToBottom());
+  }
+  new ResizeObserver(() => {
+    updateScrollbar();
+    updateJumpBottomButton();
+  }).observe(messagesDiv);
 
   // Drag logic
   let dragStartY = 0, dragStartScrollTop = 0, isDragging = false;
@@ -3048,13 +3229,22 @@
         autoResize();
         return;
       }
+      const welcome = messagesDiv.querySelector('.welcome-msg');
+      if (welcome) welcome.remove();
+      appendVisibleUserMessage(text, []);
+      scrollToBottom();
+      send({ type: 'message', text, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
+      msgInput.value = '';
+      autoResize();
+      startGenerating();
+      return;
     }
 
     // Regular message
     const welcome = messagesDiv.querySelector('.welcome-msg');
     if (welcome) welcome.remove();
     const attachments = pendingAttachments.map((attachment) => ({ ...attachment }));
-    messagesDiv.appendChild(createMsgElement('user', text, attachments));
+    appendVisibleUserMessage(text, attachments);
     scrollToBottom();
 
     send({ type: 'message', text, attachments, sessionId: currentSessionId, mode: currentMode, agent: currentAgent });
@@ -4983,18 +5173,18 @@
     rememberPw.checked = true;
   }
 
-  // Visibility change: re-sync state when user returns to tab (critical for mobile)
+  // Visibility change: refresh lightweight state only. Reloading the current
+  // session here rebuilds the message DOM and disrupts users reading history.
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
     if (!ws || ws.readyState > 1) {
       // WS is dead, force reconnect
       connect();
     } else if (ws.readyState === 1 && currentSessionId) {
-      // Preserve active streaming UI when returning to foreground.
-      if (isGenerating || currentSessionRunning) {
-        send({ type: 'load_session', sessionId: currentSessionId });
+      if ((isGenerating || currentSessionRunning) && autoStickToBottom) {
+        beginSessionSwitch(currentSessionId, { blocking: false, force: true, preserveScroll: true });
       } else {
-        beginSessionSwitch(currentSessionId, { blocking: false, force: true });
+        send({ type: 'list_sessions' });
       }
     }
   });
